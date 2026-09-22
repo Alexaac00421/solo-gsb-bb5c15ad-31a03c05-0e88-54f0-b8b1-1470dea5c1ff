@@ -196,3 +196,88 @@ def verify_chain(
         "failure_reason": failure_reason,
     }
     return events, summary
+
+
+class AuditChainError(Exception):
+    """A stored audit window is inconsistent with its hashed boundaries.
+
+    Carries the machine-readable failure reason (same vocabulary as
+    ``verify_chain``) and the sequence number of the first failing event.
+    """
+
+    def __init__(self, reason: str, seq: int):
+        super().__init__(f"audit chain verification failed at seq {seq}: {reason}")
+        self.reason = reason
+        self.seq = seq
+
+
+def verify_event_window(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    start_seq: int,
+    boundary_hash: str,
+) -> list[dict[str, Any]]:
+    """Verify a contiguous audit window read for snapshot export.
+
+    The window covers ``start_seq + 1`` onward; ``boundary_hash`` is the
+    ``event_hash`` of the event immediately before the first row (the genesis
+    ``""`` when the window starts at seq 1). Every row must carry the expected
+    next sequence number, link to the previous event hash, and reproduce its
+    stored hash from the canonical content. The first failing row raises
+    :class:`AuditChainError` -- this is what makes a cursor's predecessor hash
+    a tamper check against the database boundary rather than an opaque token.
+    """
+    events: list[dict[str, Any]] = []
+    prev_hash = boundary_hash
+    expected_seq = start_seq + 1
+
+    for row in rows:
+        seq = row["seq"]
+        if seq != expected_seq:
+            # Gap inside the window (deleted rows), a duplicate, or a read that
+            # is not aligned with the cursor boundary.
+            raise AuditChainError(FAIL_SEQUENCE, seq if isinstance(seq, int) else expected_seq)
+
+        try:
+            details = (
+                json.loads(row["details"])
+                if row["details"] is not None
+                else {}
+            )
+            if not isinstance(details, dict):
+                raise ValueError("details must be a JSON object")
+        except (TypeError, ValueError):
+            raise AuditChainError(FAIL_MALFORMED_DETAILS, seq)
+
+        content = canonical_content(
+            row["session_id"],
+            seq,
+            row["event_type"],
+            row["occurred_at"],
+            row["result"],
+            details,
+        )
+        if content.decode("utf-8") != row["canonical_content"]:
+            raise AuditChainError(FAIL_CONTENT, seq)
+        if row["prev_hash"] != prev_hash:
+            raise AuditChainError(FAIL_PREV_HASH, seq)
+        expected_hash = build_event_hash(prev_hash, content)
+        if not hmac.compare_digest(expected_hash, row["event_hash"]):
+            raise AuditChainError(FAIL_HASH, seq)
+
+        events.append(
+            {
+                "seq": seq,
+                "type": row["event_type"],
+                "timestamp": row["occurred_at"],
+                "result": row["result"],
+                "details": details,
+                "prev_hash": row["prev_hash"],
+                "event_hash": row["event_hash"],
+                "valid": True,
+            }
+        )
+        prev_hash = row["event_hash"]
+        expected_seq += 1
+
+    return events

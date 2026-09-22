@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -81,6 +82,14 @@ CREATE TABLE IF NOT EXISTS audit_events (
     PRIMARY KEY (session_id, seq),
     FOREIGN KEY (session_id) REFERENCES sessions (id)
 );
+
+-- Small key/value store for service-managed secrets (e.g. the HMAC key that
+-- authenticates stateless audit-export cursors). The value is generated once
+-- and persisted, so cursors stay resumable across restarts.
+CREATE TABLE IF NOT EXISTS app_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL
+);
 """
 
 
@@ -101,6 +110,7 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
+        self._cursor_signing_key: bytes | None = None
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -564,6 +574,78 @@ class Database:
                 "FROM audit_events WHERE session_id = ? ORDER BY seq ASC",
                 (session_id,),
             ).fetchall()
+
+    def get_audit_head(
+        self, session_id: str, max_seq: int | None = None
+    ) -> sqlite3.Row | None:
+        """Latest audit event for a session (optionally at/below ``max_seq``).
+
+        ``max_seq`` fixes the snapshot boundary: reads issued under a snapshot
+        never observe events appended after it.
+        """
+        with self._lock:
+            if max_seq is None:
+                return self._conn.execute(
+                    "SELECT session_id, seq, event_hash, prev_hash "
+                    "FROM audit_events WHERE session_id = ? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            return self._conn.execute(
+                "SELECT session_id, seq, event_hash, prev_hash "
+                "FROM audit_events WHERE session_id = ? AND seq <= ? "
+                "ORDER BY seq DESC LIMIT 1",
+                (session_id, max_seq),
+            ).fetchone()
+
+    def get_audit_event(self, session_id: str, seq: int) -> sqlite3.Row | None:
+        """A single audit row by ``(session_id, seq)`` (boundary lookups)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT session_id, seq, event_hash, prev_hash "
+                "FROM audit_events WHERE session_id = ? AND seq = ?",
+                (session_id, seq),
+            ).fetchone()
+
+    def get_audit_window(
+        self, session_id: str, after_seq: int, max_seq: int, limit: int
+    ) -> list[sqlite3.Row]:
+        """Raw audit rows ``after_seq < seq <= max_seq`` (up to ``limit``)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT session_id, seq, event_type, occurred_at, result, "
+                "details, prev_hash, event_hash, canonical_content "
+                "FROM audit_events WHERE session_id = ? AND seq > ? AND seq <= ? "
+                "ORDER BY seq ASC LIMIT ?",
+                (session_id, after_seq, max_seq, limit),
+            ).fetchall()
+
+    # ---- app metadata ---------------------------------------------------
+
+    def cursor_signing_key(self) -> bytes:
+        """Return the HMAC key authenticating stateless export cursors.
+
+        The key is generated once (32 random bytes, hex encoded) and stored in
+        ``app_meta`` inside a write transaction, so cursors remain verifiable
+        across process restarts.
+        """
+        if self._cursor_signing_key is not None:
+            return self._cursor_signing_key
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT value FROM app_meta WHERE key = 'cursor_signing_key'"
+            ).fetchone()
+            if row is None:
+                value = secrets.token_hex(32)
+                self._conn.execute(
+                    "INSERT INTO app_meta (key, value) VALUES "
+                    "('cursor_signing_key', ?)",
+                    (value,),
+                )
+            else:
+                value = row["value"]
+        self._cursor_signing_key = value.encode("ascii")
+        return self._cursor_signing_key
 
 
 class IdempotencyConflict(Exception):

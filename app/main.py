@@ -11,12 +11,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 
-from . import audit, sharing
+from . import audit, audit_cursor, sharing
 from .database import (
     Database,
     IdempotencyConflict,
@@ -31,6 +31,10 @@ API_KEY = os.environ.get("DR_API_KEY") or None
 
 MAX_KEY_BYTES = 4096
 MAX_REQUEST_BODY_BYTES = 1024 * 1024  # generous bound: 255 shares of 4 KiB each
+
+# Snapshot audit export pagination.
+DEFAULT_AUDIT_LIMIT = 100
+MAX_AUDIT_LIMIT = 1000
 
 
 # --------------------------------------------------------------------------
@@ -335,24 +339,195 @@ def get_session(session_id: str, database: Database = Depends(db)):
     tags=["sessions"],
     dependencies=[Depends(require_api_key)],
 )
-def get_session_audit(session_id: str, database: Database = Depends(db)):
+def get_session_audit(
+    session_id: str,
+    cursor: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_AUDIT_LIMIT),
+    database: Database = Depends(db),
+):
     """Return the session's tamper-evident audit chain.
 
-    Events are listed in sequence order together with the whole-chain
-    ``valid`` state. If any historical field or predecessor hash has been
-    altered, ``chain.first_invalid_seq`` pinpoints the first failing event and
-    ``chain.failure_reason`` names the check that broke.
+    Two modes:
+
+    * **Legacy (no arguments).** With neither ``cursor`` nor ``limit`` the full
+      chain is returned in sequence order together with the whole-chain
+      ``valid`` state. If any historical field or predecessor hash has been
+      altered, ``chain.first_invalid_seq`` pinpoints the first failing event
+      and ``chain.failure_reason`` names the check that broke.
+
+    * **Snapshot export (``limit`` and/or ``cursor``).** The first request
+      fixes the current chain head as an immutable snapshot (``snapshot_seq`` /
+      ``snapshot_hash``) and returns at most ``limit`` events plus an opaque
+      ``next_cursor``. Every later page is bound to the same session and
+      snapshot, reads only events up to ``snapshot_seq``, and re-checks the
+      cursor's predecessor hashes against the database boundary -- so pages
+      stay contiguous even when new audit events arrive during the export, and
+      a tampered or cross-session cursor is rejected uniformly. The final page
+      has ``next_cursor: null`` and its last event hash equals the snapshot
+      hash; an interrupted cursor can simply be replayed to resume.
     """
     row = database.get_session(session_id)
     if row is None:
         raise error("session_not_found", "recovery session does not exist", 404)
-    rows = database.get_audit_events(session_id)
-    events, chain = audit.verify_chain(rows)
+
+    if cursor is None and limit is None:
+        rows = database.get_audit_events(session_id)
+        events, chain = audit.verify_chain(rows)
+        return {
+            "session_id": session_id,
+            "events": events,
+            "chain": chain,
+        }
+
+    page_limit = limit or DEFAULT_AUDIT_LIMIT
+    signing_key = database.cursor_signing_key()
+
+    if cursor is None:
+        # First page: pin the current chain head as the snapshot.
+        head = database.get_audit_head(session_id)
+        if head is None:
+            snapshot_seq = 0
+            snapshot_hash = audit.GENESIS_HASH
+        else:
+            snapshot_seq = head["seq"]
+            snapshot_hash = head["event_hash"]
+        last_seq = 0
+        last_hash = audit.GENESIS_HASH
+    else:
+        try:
+            token = audit_cursor.decode_cursor(cursor, signing_key, session_id)
+        except audit_cursor.InvalidCursor as exc:
+            raise _invalid_cursor_error() from exc
+        snapshot_seq = token["snapshot_seq"]
+        snapshot_hash = token["snapshot_hash"]
+        last_seq = token["last_seq"]
+        last_hash = token["last_hash"]
+
+        # The snapshot must still describe a real stored boundary: the event at
+        # snapshot_seq must exist and hash exactly as the cursor claims. If the
+        # database moved under it (tampering/truncation) the cursor cannot be
+        # honoured and the export must restart.
+        if snapshot_seq == 0:
+            snapshot_head = database.get_audit_head(
+                session_id, max_seq=0
+            )
+            if snapshot_head is not None:
+                raise _invalid_cursor_error()
+        else:
+            snapshot_head = database.get_audit_event(session_id, snapshot_seq)
+            if (
+                snapshot_head is None
+                or not hmac.compare_digest(
+                    snapshot_head["event_hash"], snapshot_hash
+                )
+            ):
+                raise _invalid_cursor_error()
+
+        # The cursor's delivered boundary must match the same database row, so
+        # a cursor whose predecessor hash was forged (or whose history was
+        # rewritten after it was issued) cannot progress.
+        if last_seq > 0:
+            boundary = database.get_audit_event(session_id, last_seq)
+            if (
+                boundary is None
+                or not hmac.compare_digest(boundary["event_hash"], last_hash)
+            ):
+                raise _invalid_cursor_error()
+        # last_seq == 0 pins the genesis boundary; decode_cursor already
+        # enforced last_hash == "" for that case.
+
+    window = database.get_audit_window(
+        session_id, last_seq, snapshot_seq, page_limit
+    )
+    try:
+        events = audit.verify_event_window(
+            window, start_seq=last_seq, boundary_hash=last_hash
+        )
+    except audit.AuditChainError as exc:
+        # The stored rows no longer reproduce the hash chain between the cursor
+        # boundary and the snapshot head.
+        raise error(
+            "audit_chain_tampered",
+            "the stored audit chain is inconsistent; snapshot export aborted",
+            409,
+            details={
+                "first_invalid_seq": exc.seq,
+                "failure_reason": exc.reason,
+            },
+        )
+
+    if not events:
+        # No rows where the chain promised them: the snapshot head vanished
+        # (truncation) even though the boundary lookup succeeded.
+        if snapshot_seq != last_seq:
+            raise error(
+                "audit_chain_tampered",
+                "the stored audit chain is inconsistent; snapshot export aborted",
+                409,
+                details={
+                    "expected_seq": last_seq + 1,
+                    "failure_reason": audit.FAIL_SEQUENCE,
+                },
+            )
+    else:
+        last_seq = events[-1]["seq"]
+        last_hash = events[-1]["event_hash"]
+
+    # Only the rows actually read determine "more pages". With a truncated
+    # database the last delivered event can sit below snapshot_seq; that case
+    # was caught above as a chain error.
+    has_more = last_seq < snapshot_seq
+    if not has_more and events:
+        # Defence in depth: when a page actually reaches the pinned chain head,
+        # the stitched export must end with that exact hash. The snapshot
+        # boundary lookup already proved this row; a mismatch here means the
+        # read window disagreed with it. An empty final page is legitimate
+        # (the cursor was replayed after the export already finished).
+        if not hmac.compare_digest(
+            events[-1]["event_hash"], snapshot_hash
+        ):
+            raise error(
+                "audit_chain_tampered",
+                "the stored audit chain is inconsistent; snapshot export aborted",
+                409,
+                details={
+                    "expected_seq": snapshot_seq,
+                    "failure_reason": audit.FAIL_HASH,
+                },
+            )
+    next_cursor = (
+        audit_cursor.make_cursor(
+            session_id=session_id,
+            snapshot_seq=snapshot_seq,
+            snapshot_hash=snapshot_hash,
+            last_seq=last_seq,
+            last_hash=last_hash,
+            signing_key=signing_key,
+        )
+        if has_more
+        else None
+    )
+
     return {
         "session_id": session_id,
         "events": events,
-        "chain": chain,
+        "snapshot_seq": snapshot_seq,
+        "snapshot_hash": snapshot_hash,
+        "next_cursor": next_cursor,
+        "limit": page_limit,
     }
+
+
+def _invalid_cursor_error() -> HTTPException:
+    # One uniform error for every malformed, forged, expired-snapshot,
+    # truncated-boundary or cross-session cursor: callers cannot use the
+    # response to distinguish the cases.
+    return error(
+        "invalid_cursor",
+        "invalid, tampered or cross-session audit export cursor; "
+        "restart the export without a cursor",
+        400,
+    )
 
 
 def _submit_replay(session_id: str, status: str) -> dict:
