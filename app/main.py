@@ -11,12 +11,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 
-from . import audit, sharing
+from . import audit, cursor, sharing
 from .database import (
     Database,
     IdempotencyConflict,
@@ -335,23 +335,177 @@ def get_session(session_id: str, database: Database = Depends(db)):
     tags=["sessions"],
     dependencies=[Depends(require_api_key)],
 )
-def get_session_audit(session_id: str, database: Database = Depends(db)):
+def get_session_audit(
+    session_id: str,
+    limit: int | None = Query(
+        default=None,
+        ge=cursor.MIN_LIMIT,
+        le=cursor.MAX_LIMIT,
+        description="Page size; enables snapshot-cursor export.",
+    ),
+    cursor_token: str | None = Query(default=None, alias="cursor"),
+    database: Database = Depends(db),
+):
     """Return the session's tamper-evident audit chain.
 
-    Events are listed in sequence order together with the whole-chain
-    ``valid`` state. If any historical field or predecessor hash has been
-    altered, ``chain.first_invalid_seq`` pinpoints the first failing event and
-    ``chain.failure_reason`` names the check that broke.
+    Without any query parameters this is the original, backwards-compatible
+    behaviour: every event is listed in sequence order together with the
+    whole-chain ``valid`` state. If any historical field or predecessor hash
+    has been altered, ``chain.first_invalid_seq`` pinpoints the first failing
+    event and ``chain.failure_reason`` names the check that broke.
+
+    Paged, resumable export is enabled by ``limit`` (first page) or ``cursor``
+    (subsequent pages). The first request fixes an immutable snapshot of the
+    current chain head and returns ``snapshot_seq``/``snapshot_hash`` plus an
+    opaque ``next_cursor``; later requests read only events inside that
+    snapshot, so pages stitch together contiguously even while new audit
+    events are being appended. A cursor is cryptographically bound to the
+    session and the snapshot; tampering or reusing it for another session
+    yields a uniform ``invalid_cursor`` error. The last page carries
+    ``next_cursor: null``.
     """
     row = database.get_session(session_id)
     if row is None:
         raise error("session_not_found", "recovery session does not exist", 404)
-    rows = database.get_audit_events(session_id)
-    events, chain = audit.verify_chain(rows)
+
+    if limit is None and cursor_token is None:
+        # Legacy, parameter-less behaviour: whole chain + summary in one call.
+        rows = database.get_audit_events(session_id)
+        events, chain = audit.verify_chain(rows)
+        return {
+            "session_id": session_id,
+            "events": events,
+            "chain": chain,
+        }
+
+    return _export_audit_page(database, session_id, limit, cursor_token)
+
+
+def _invalid_cursor() -> HTTPException:
+    """Uniform error for every bad/tampered/reused cursor."""
+    return error(
+        "invalid_cursor",
+        "cursor is invalid, expired or bound to another session",
+        400,
+    )
+
+
+def _export_audit_page(
+    database: Database,
+    session_id: str,
+    limit: int | None,
+    cursor_token: str | None,
+) -> dict:
+    """One bounded, snapshot-stable page of audit events.
+
+    Two entry shapes:
+
+    * first page: ``limit`` given (optionally defaulted), no cursor -- fix the
+      current chain head as the snapshot;
+    * later page: cursor given (``limit`` optional, defaults to the export
+      default) -- resume inside the fixed snapshot.
+    """
+    key = database.get_export_key()
+
+    if cursor_token is None:
+        page_limit = limit if limit is not None else cursor.DEFAULT_LIMIT
+        head = database.get_audit_head(session_id)
+        if head is None:
+            # No events yet: an empty snapshot; nothing to page through.
+            return {
+                "session_id": session_id,
+                "events": [],
+                "next_cursor": None,
+                "snapshot_seq": 0,
+                "snapshot_hash": None,
+            }
+        snapshot_seq, snapshot_hash = head
+        after_seq, after_hash = 0, audit.GENESIS_HASH
+        snapshot_rows = database.get_audit_events(
+            session_id, max_seq=snapshot_seq
+        )
+        # Single read fixes the head; the bounded prefix must be gap-free and
+        # end exactly at the hash we just snapshotted. New events appended
+        # concurrently are excluded by the seq bound; only an out-of-band
+        # rewrite can trigger this.
+        if len(snapshot_rows) != snapshot_seq or not hmac.compare_digest(
+            snapshot_rows[-1]["event_hash"], snapshot_hash
+        ):
+            raise error(
+                "audit_chain_modified",
+                "the audit chain changed while fixing the export snapshot; "
+                "please retry",
+                409,
+            )
+    else:
+        page_limit = limit if limit is not None else cursor.DEFAULT_LIMIT
+        try:
+            state = cursor.decode_cursor(key, cursor_token)
+        except cursor.InvalidCursor:
+            raise _invalid_cursor()
+
+        # Cursors are bound to one specific session.
+        if not hmac.compare_digest(
+            state[cursor.FIELD_SESSION], session_id
+        ):
+            raise _invalid_cursor()
+        snapshot_seq = state[cursor.FIELD_SNAPSHOT_SEQ]
+        snapshot_hash = state[cursor.FIELD_SNAPSHOT_HASH]
+        after_seq = state[cursor.FIELD_AFTER_SEQ]
+        after_hash = state[cursor.FIELD_AFTER_HASH]
+
+        # Read strictly inside the snapshot: events appended after the first
+        # request are never part of any page. The audit chain is append-only,
+        # so the snapshot head survives new events being written during the
+        # export; a missing/changed head means history was tampered with or
+        # truncated.
+        snapshot_rows = database.get_audit_events(
+            session_id, max_seq=snapshot_seq
+        )
+        if (
+            len(snapshot_rows) != snapshot_seq
+            or not hmac.compare_digest(
+                snapshot_rows[-1]["event_hash"], snapshot_hash
+            )
+        ):
+            raise _invalid_cursor()
+
+        # Checkpoint boundary: the hash the cursor claims as delivered must
+        # match the database row at after_seq (genesis boundary for after 0).
+        # This binds the cursor to the actual database edge, so an edited
+        # predecessor hash / rewritten checkpoint cannot be replayed.
+        if after_seq == 0:
+            if after_hash != audit.GENESIS_HASH:
+                raise _invalid_cursor()
+        else:
+            checkpoint = snapshot_rows[after_seq - 1]
+            if checkpoint["seq"] != after_seq or not hmac.compare_digest(
+                checkpoint["event_hash"], after_hash
+            ):
+                raise _invalid_cursor()
+
+    events, _summary = audit.verify_chain(snapshot_rows)
+    page = events[after_seq : after_seq + page_limit]
+
+    delivered = after_seq + len(page)
+    if delivered >= snapshot_seq:
+        next_cursor: str | None = None
+    else:
+        next_cursor = cursor.encode_cursor(
+            key,
+            session_id=session_id,
+            snapshot_seq=snapshot_seq,
+            snapshot_hash=snapshot_hash,
+            after_seq=delivered,
+            after_hash=page[-1]["event_hash"],
+        )
+
     return {
         "session_id": session_id,
-        "events": events,
-        "chain": chain,
+        "events": page,
+        "next_cursor": next_cursor,
+        "snapshot_seq": snapshot_seq,
+        "snapshot_hash": snapshot_hash,
     }
 
 

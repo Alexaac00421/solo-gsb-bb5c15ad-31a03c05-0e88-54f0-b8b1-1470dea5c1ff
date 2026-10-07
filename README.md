@@ -37,6 +37,7 @@
 │   ├── sharing.py     # Shamir 拆分/重建、分片令牌编解码
 │   ├── gf256.py       # GF(2^8) 有限域运算（AES 多项式 0x11b）
 │   ├── audit.py       # 审计事件规范化、SHA-256 哈希链与整链校验
+│   ├── cursor.py      # 快照导出游标：HMAC 签名、校验与编解码
 │   └── database.py    # SQLite 建表、事务与审计链追加
 ├── tests/             # pytest：100+ 用例（域运算/拆分/API/轮换/审计链/安全场景）
 ├── entrypoint.sh      # 启动前初始化数据库，然后起 uvicorn
@@ -79,7 +80,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/sessions/{id}/shares` | 校验分片并在达到阈值时重建密钥 |
 | POST | `/api/v1/sessions/{id}/rotate` | 凭旧阈值分片以新 `(t, n)` 轮换会话（幂等、事务性） |
 | POST | `/api/v1/sessions/{id}/revoke` | 撤销会话（幂等） |
-| GET  | `/api/v1/sessions/{id}/audit` | 按序返回审计事件及整链校验状态（含首个失效序号） |
+| GET  | `/api/v1/sessions/{id}/audit` | 按序返回审计事件及整链校验状态（含首个失效序号）；加 `limit`/`cursor` 走可恢复的快照式分页导出 |
 
 所有错误响应统一为：
 
@@ -296,6 +297,62 @@ curl http://localhost:8000/api/v1/sessions/a1b2…/audit
   `gap_or_duplicate_sequence`（事件被删/序号重复）。校验始终以库中前序哈希继续
   向后比对，因此首个断点之后的事件不会被误报为新的首个断点。
 
+#### 无参数查询（兼容行为）
+
+不带任何查询参数时行为与旧版本完全一致：一次返回**全部**事件与整链校验摘要
+`chain`。已有客户端无需改动。
+
+#### 可恢复的快照式游标导出
+
+需要分页/断点续传时，在同一接口上加 `limit`（首次）与 `cursor`（后续）：
+
+- **首次请求**加 `limit`（1–1000，默认 200），服务固定当前链头为不可变快照，
+  返回至多 `limit` 条事件，并在响应中给出：
+  - `snapshot_seq`：快照链头序号；
+  - `snapshot_hash`：快照链头事件的 `event_hash`；
+  - `next_cursor`：不透明游标（最后一页为 `null`）。
+- **后续请求**携带 `?cursor=<next_cursor>`（可另带 `limit`）。游标在密码学上
+  与**会话**和**该快照**绑定，且只读取 `seq <= snapshot_seq` 的事件。因此即使
+  导出期间审计链持续增长，各页事件也严格连续、无重复无遗漏，拼接结果与首次
+  快照完全一致，最终链头哈希始终等于首次返回的 `snapshot_hash`。
+- **断点续传**：游标无服务端状态（HMAC-SHA256 签名，密钥存于数据库，服务
+  重启后仍可校验），中断后保存上一页的 `next_cursor` 即可从断点继续；重复
+  使用同一游标是幂等的，返回同一页。
+- 每页事件仍带各自的 `prev_hash`/`event_hash`/`valid`，但分页响应不含整链
+  摘要 `chain`（快照边界内的链可由拼接后的事件自行校验）。
+
+```bash
+# 首次：固定快照，每页 100 条
+curl 'http://localhost:8000/api/v1/sessions/a1b2…/audit?limit=100'
+# 后续：带上上一页的游标继续
+curl 'http://localhost:8000/api/v1/sessions/a1b2…/audit?cursor=<next_cursor>&limit=100'
+```
+
+```json
+{
+  "session_id": "a1b2…",
+  "events": [ {"seq": 1, "type": "session_created", "...": "…"} ],
+  "next_cursor": "eyJhZnRlcl9…（不透明、已签名）",
+  "snapshot_seq": 42,
+  "snapshot_hash": "565ad5a1…"
+}
+```
+
+游标安全与错误语义：
+
+| 情形 | 结果 |
+| --- | --- |
+| 游标被篡改（载荷/签名改动、伪造签名） | 400 `invalid_cursor` |
+| 游标用于其他会话（跨会话复用） | 400 `invalid_cursor` |
+| 快照链头在库中不存在或哈希不一致（历史被删/截断/改写） | 400 `invalid_cursor` |
+| 游标携带的前序哈希与数据库边界不一致（断点处被改写） | 400 `invalid_cursor` |
+| `limit` 超出 1–1000 | 422 |
+| 会话不存在（无论是否带 `cursor`） | 404 `session_not_found` |
+
+> 首次固定快照与读取之间若链头被进程外改写（正常的追加式写入不受影响），
+> 返回 409 `audit_chain_modified`，提示重试；游标续读阶段的任何边界不一致
+> 一律归并为统一的 400 `invalid_cursor`。
+
 ## 幂等性说明
 
 - **创建**：携带相同 `Idempotency-Key` 的重试返回同一个 `session_id`；首次响应
@@ -308,7 +365,9 @@ curl http://localhost:8000/api/v1/sessions/a1b2…/audit
 - **提交**：同一请求内重复索引被标记拒绝；恢复完成后重复提交不再次返回密钥。
 - **服务重启**：表结构创建使用 `CREATE TABLE IF NOT EXISTS`，启动初始化可重复执行；
   旧版本数据库启动时自动补齐 `rotated_at` / `replacement_session_id` 列，并自动
-  创建 `audit_events` 审计表（旧会话此前无事件，空链视为 valid）。
+  创建 `audit_events` 审计表（旧会话此前无事件，空链视为 valid）与 `app_meta`
+  元数据表。审计导出游标的 HMAC 密钥存于 `app_meta`（首次使用时生成），因此
+  已签发的游标在服务重启、甚至容器重建（数据卷保留）后仍可继续使用。
 
 ## 密码学实现说明
 
@@ -340,7 +399,11 @@ python -m pytest -q
 轮换全流程（成功/失败回滚/幂等重放/冲突/链式轮换/旧库迁移）、
 审计链（生命周期事件顺序、轮换双事件、回滚不留事件、哈希符合 SHA-256 规范、
 字段/时间/前序哈希/删行等篡改定位首个失效序号、并发序号连续无分叉、
-审计表不含密钥与原始分片、API Key 鉴权）等 100+ 断言。
+审计表不含密钥与原始分片、API Key 鉴权）、
+快照式游标导出（首页固定快照、各页拼接连续且链头一致、导出期间新增事件不可见、
+保存游标断点续传、最后一页 `next_cursor: null`、无参数旧行为不变、
+游标篡改/伪造/跨会话复用/删除快照头/改写断点哈希均返回统一 `invalid_cursor`、
+`limit` 校验、会话 404、重启后游标继续有效）等 100+ 断言。
 
 ## 部署注意事项
 

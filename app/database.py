@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -81,7 +82,18 @@ CREATE TABLE IF NOT EXISTS audit_events (
     PRIMARY KEY (session_id, seq),
     FOREIGN KEY (session_id) REFERENCES sessions (id)
 );
+
+-- Small key/value store for process-persistent secrets, e.g. the HMAC key that
+-- signs resumable audit-export cursors. The key is generated lazily and kept in
+-- the database so cursors remain valid after a service restart; it never leaves
+-- the server (cursor tokens only carry an HMAC, never the key).
+CREATE TABLE IF NOT EXISTS app_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
+
+EXPORT_HMAC_KEY_NAME = "export_cursor_hmac_key"
 
 
 def utcnow() -> str:
@@ -110,6 +122,8 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # Cached HMAC key for export cursors (lazily loaded, see get_export_key).
+        self._export_key_cache: bytes | None = None
         self.init_schema()
 
     def init_schema(self) -> None:
@@ -555,15 +569,78 @@ class Database:
             )
         return True
 
-    def get_audit_events(self, session_id: str) -> list[sqlite3.Row]:
-        """Raw audit rows for a session in chain order (empty list if none)."""
+    def get_audit_events(
+        self, session_id: str, max_seq: int | None = None
+    ) -> list[sqlite3.Row]:
+        """Raw audit rows for a session in chain order (empty list if none).
+
+        When ``max_seq`` is given only events with ``seq <= max_seq`` are
+        returned: this is the bounded read used by snapshot-style exports, so
+        events appended after a snapshot was taken are never observed.
+        """
         with self._lock:
+            if max_seq is None:
+                return self._conn.execute(
+                    "SELECT session_id, seq, event_type, occurred_at, result, "
+                    "details, prev_hash, event_hash, canonical_content "
+                    "FROM audit_events WHERE session_id = ? ORDER BY seq ASC",
+                    (session_id,),
+                ).fetchall()
             return self._conn.execute(
                 "SELECT session_id, seq, event_type, occurred_at, result, "
                 "details, prev_hash, event_hash, canonical_content "
-                "FROM audit_events WHERE session_id = ? ORDER BY seq ASC",
-                (session_id,),
+                "FROM audit_events WHERE session_id = ? AND seq <= ? "
+                "ORDER BY seq ASC",
+                (session_id, max_seq),
             ).fetchall()
+
+    def get_audit_head(self, session_id: str) -> tuple[int, str] | None:
+        """Return ``(max seq, event_hash)`` at the current per-session chain
+        head, or ``None`` when the session has no audit events yet.
+
+        This read fixes the snapshot for the first export page.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT seq, event_hash FROM audit_events "
+                "WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return (row["seq"], row["event_hash"]) if row is not None else None
+
+    def get_export_key(self) -> bytes:
+        """Return the HMAC key that signs audit-export cursors.
+
+        The key is generated once (32 random bytes, hex encoded) and stored in
+        ``app_meta`` so cursors stay verifiable across restarts. Creation is
+        serialised by the process lock and made idempotent with
+        ``INSERT OR IGNORE``; concurrent processes sharing one file fall back
+        to whichever row was committed first.
+        """
+        cached = self._export_key_cache
+        if cached is not None:
+            return cached
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT value FROM app_meta WHERE key = ?",
+                (EXPORT_HMAC_KEY_NAME,),
+            ).fetchone()
+            if row is not None:
+                value = row["value"]
+            else:
+                generated = secrets.token_hex(32)
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)",
+                    (EXPORT_HMAC_KEY_NAME, generated),
+                )
+                # Re-read: a concurrent process may have committed its own key
+                # first; always trust whichever value is actually stored.
+                value = self._conn.execute(
+                    "SELECT value FROM app_meta WHERE key = ?",
+                    (EXPORT_HMAC_KEY_NAME,),
+                ).fetchone()["value"]
+            self._export_key_cache = bytes.fromhex(value)
+        return self._export_key_cache
 
 
 class IdempotencyConflict(Exception):

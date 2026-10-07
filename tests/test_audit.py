@@ -556,3 +556,342 @@ class TestAuditApiKeyAuth:
         )
         assert r.status_code == 200
         assert r.json()["chain"]["valid"] is True
+
+
+# --------------------------------------------------------------------------
+# Resumable snapshot-cursor export
+# --------------------------------------------------------------------------
+
+def _grow_chain(client, sid, data, partial_count=0):
+    """Append audit events through normal business operations."""
+    shares = data["shares"]
+    for i in range(partial_count):
+        client.post(
+            f"/api/v1/sessions/{sid}/shares", json={"shares": [shares[i % 2]]}
+        )
+
+
+def _walk_export(client, sid, page_size=2, params_extra=None):
+    """Page through the whole export; return (pages, first_body)."""
+    pages = []
+    params = {"limit": page_size}
+    if params_extra:
+        params.update(params_extra)
+    body = client.get(f"/api/v1/sessions/{sid}/audit", params=params).json()
+    first = body
+    while True:
+        pages.append(body["events"])
+        token = body["next_cursor"]
+        if token is None:
+            break
+        params = {"cursor": token, "limit": page_size}
+        if params_extra:
+            params.update(params_extra)
+        body = client.get(
+            f"/api/v1/sessions/{sid}/audit", params=params
+        ).json()
+    return pages, first
+
+
+def test_legacy_paramaterless_query_unchanged(client):
+    data = create(client, t=2, n=3)
+    body = audit(client, data["session_id"]).json()
+    assert "chain" in body and "events" in body
+    assert "next_cursor" not in body
+    assert "snapshot_seq" not in body
+    assert body["chain"]["valid"] is True
+    assert body["chain"]["event_count"] == 1
+
+
+def test_export_first_page_fixes_snapshot(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=2)
+    full = audit(client, sid).json()
+    expected_seq = full["chain"]["event_count"]
+    expected_head_hash = full["events"][-1]["event_hash"]
+
+    r = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["snapshot_seq"] == expected_seq
+    assert body["snapshot_hash"] == expected_head_hash
+    assert len(body["events"]) == 2
+    assert body["events"][0]["seq"] == 1
+    assert body["events"][1]["seq"] == 2
+    assert body["next_cursor"] is not None
+    # Paged responses carry no whole-chain summary.
+    assert "chain" not in body
+
+
+def test_export_pages_stitch_into_full_chain(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=4)
+
+    pages, first = _walk_export(client, sid, page_size=2)
+    flat = [ev for page in pages for ev in page]
+    full_events = audit(client, sid).json()["events"]
+    assert [e["seq"] for e in flat] == [e["seq"] for e in full_events]
+    assert [e["event_hash"] for e in flat] == [
+        e["event_hash"] for e in full_events
+    ]
+    # Page boundaries never duplicate or skip events.
+    assert [e["seq"] for e in flat] == list(range(1, len(flat) + 1))
+    assert all(len(p) == 2 for p in pages[:-1])
+    assert first["snapshot_seq"] == len(flat)
+
+
+def test_export_last_page_next_cursor_is_null(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=3)  # 4 events total
+
+    body = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"limit": 10}
+    ).json()
+    assert len(body["events"]) == 4
+    assert body["next_cursor"] is None
+
+
+def test_export_exact_page_boundary(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=1)  # 2 events
+    body = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 2}).json()
+    assert len(body["events"]) == 2
+    assert body["next_cursor"] is None
+
+
+def test_export_resumable_from_saved_cursor(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=4)  # 5 events
+
+    first = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"limit": 2}
+    ).json()
+    saved_cursor = first["next_cursor"]
+    # Resume later (possibly a different "connection") with the saved token.
+    second = client.get(
+        f"/api/v1/sessions/{sid}/audit",
+        params={"cursor": saved_cursor, "limit": 2},
+    ).json()
+    assert [e["seq"] for e in second["events"]] == [3, 4]
+    assert second["snapshot_seq"] == first["snapshot_seq"]
+    assert second["snapshot_hash"] == first["snapshot_hash"]
+    last = client.get(
+        f"/api/v1/sessions/{sid}/audit",
+        params={"cursor": second["next_cursor"]},
+    ).json()
+    assert [e["seq"] for e in last["events"]] == [5]
+    assert last["next_cursor"] is None
+    assert last["snapshot_hash"] == first["snapshot_hash"]
+
+
+def test_export_snapshot_is_stable_while_events_are_appended(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=1)  # 2 events at snapshot
+
+    first = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 1}).json()
+    assert first["snapshot_seq"] == 2
+
+    # New business activity appends events *during* the export.
+    _grow_chain(client, sid, data, partial_count=3)  # now 5 events
+    assert audit(client, sid).json()["chain"]["event_count"] == 5
+
+    # Paged continuation still reads only the original snapshot.
+    second = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"cursor": first["next_cursor"]}
+    ).json()
+    assert [e["seq"] for e in second["events"]] == [2]
+    assert second["next_cursor"] is None
+    assert second["snapshot_seq"] == 2
+    assert second["snapshot_hash"] == first["snapshot_hash"]
+
+    # A fresh first page fixes the new head.
+    fresh = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 10}).json()
+    assert fresh["snapshot_seq"] == 5
+    assert len(fresh["events"]) == 5
+
+
+def test_export_cursor_cannot_be_reused_across_sessions(client):
+    a = create(client, secret="secret-a", t=2, n=3)
+    b = create(client, secret="secret-b", t=2, n=3)
+    first = client.get(
+        f"/api/v1/sessions/{a['session_id']}/audit", params={"limit": 1}
+    ).json()
+    r = client.get(
+        f"/api/v1/sessions/{b['session_id']}/audit",
+        params={"cursor": first["next_cursor"]},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_export_garbage_cursor_is_uniform_error(client):
+    data = create(client)
+    for bad in ["", "not-a-cursor", "aaa.bbb", "####", "null", "e30.e30"]:
+        r = client.get(
+            f"/api/v1/sessions/{data['session_id']}/audit",
+            params={"cursor": bad},
+        )
+        assert r.status_code == 400, (bad, r.text)
+        body = r.json()["error"]
+        assert body["code"] == "invalid_cursor"
+        assert "details" in body
+
+
+def test_export_tampered_cursor_payload_rejected(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=2)
+    first = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 1}).json()
+    token = first["next_cursor"]
+    body_b64, _, sig_b64 = token.partition(".")
+
+    # Flip a byte in the signed payload; the signature must no longer match.
+    raw = bytearray(__import__("base64").urlsafe_b64decode(body_b64 + "=="))
+    raw[-1] ^= 0x01
+    flipped = __import__("base64").urlsafe_b64encode(bytes(raw)).rstrip(b"=").decode()
+    r = client.get(
+        f"/api/v1/sessions/{sid}/audit",
+        params={"cursor": f"{flipped}.{sig_b64}"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+    # A signature forged without the server key is rejected as well.
+    forged_sig = __import__("base64").urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
+    r = client.get(
+        f"/api/v1/sessions/{sid}/audit",
+        params={"cursor": f"{body_b64}.{forged_sig}"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_export_cursor_rejected_when_snapshot_head_deleted(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=2)  # 3 events
+    first = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 1}).json()
+    token = first["next_cursor"]
+
+    conn = sqlite3.connect(os.environ["DR_DB_PATH"])
+    # Delete the snapshot head (seq 3): the cursor's snapshot_hash no longer
+    # exists as a boundary in the database.
+    conn.execute(
+        "DELETE FROM audit_events WHERE session_id=? AND seq=3", (sid,)
+    )
+    conn.commit()
+    r = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"cursor": token}
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_export_cursor_rejected_when_checkpoint_hash_changed(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=2)  # 3 events
+    first = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 1}).json()
+    token = first["next_cursor"]  # checkpoint = seq 1
+
+    conn = sqlite3.connect(os.environ["DR_DB_PATH"])
+    # Rewrite seq 1's own event hash (out-of-band tamper at the cursor's
+    # predecessor boundary): the database boundary no longer matches.
+    conn.execute(
+        "UPDATE audit_events SET event_hash=? WHERE session_id=? AND seq=1",
+        ("a" * 64, sid),
+    )
+    conn.commit()
+    r = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"cursor": token}
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_export_cursor_replayed_returns_same_page(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    _grow_chain(client, sid, data, partial_count=3)  # 4 events
+    first = client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 2}).json()
+    token = first["next_cursor"]
+    r1 = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"cursor": token}
+    ).json()
+    r2 = client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"cursor": token}
+    ).json()
+    assert r1 == r2
+    assert [e["seq"] for e in r1["events"]] == [3, 4]
+    assert r1["next_cursor"] is None
+
+
+def test_export_limit_validation(client):
+    data = create(client)
+    sid = data["session_id"]
+    assert client.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 0}).status_code == 422
+    assert client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"limit": 1001}
+    ).status_code == 422
+    assert client.get(
+        f"/api/v1/sessions/{sid}/audit", params={"limit": -1}
+    ).status_code == 422
+
+
+def test_export_empty_session_snapshot(client):
+    # A freshly created session always has its genesis event, but verify the
+    # zero-event shape via a session-less check is impossible; instead a
+    # session whose audit row count is exactly one pages a single event.
+    data = create(client)
+    body = client.get(
+        f"/api/v1/sessions/{data['session_id']}/audit", params={"limit": 50}
+    ).json()
+    assert body["snapshot_seq"] == 1
+    assert len(body["events"]) == 1
+    assert body["next_cursor"] is None
+    assert len(body["snapshot_hash"]) == 64
+
+
+def test_export_not_found(client):
+    r = client.get("/api/v1/sessions/deadbeefdead/audit", params={"limit": 10})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "session_not_found"
+    r = client.get(
+        "/api/v1/sessions/deadbeefdead/audit", params={"cursor": "x.y"}
+    )
+    assert r.status_code == 404
+
+
+def test_export_cursor_survives_database_reopen(tmp_path, monkeypatch):
+    """The HMAC key persists, so cursors stay resumable across restarts."""
+    db_path = str(tmp_path / "restart.db")
+    monkeypatch.setenv("DR_DB_PATH", db_path)
+    import app.main as main
+
+    importlib.reload(main)
+
+    with TestClient(main.app) as c:
+        data = create(c)
+        sid = data["session_id"]
+        _grow_chain(c, sid, data, partial_count=2)  # 3 events
+        first = c.get(f"/api/v1/sessions/{sid}/audit", params={"limit": 1}).json()
+        token = first["next_cursor"]
+        snapshot_hash = first["snapshot_hash"]
+
+    # Simulate a process restart: drop the app and rebuild it over the file.
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        r = c.get(
+            f"/api/v1/sessions/{sid}/audit", params={"cursor": token}
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["snapshot_hash"] == snapshot_hash
+        assert [e["seq"] for e in body["events"]] == [2, 3]
+        assert body["next_cursor"] is None
